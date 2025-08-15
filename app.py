@@ -8,6 +8,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import requests
 import streamlit as st
 from instaloader import Instaloader, Post
+from instaloader import exceptions as insta_exceptions
 
 
 # ==========================
@@ -79,7 +80,7 @@ def _build_loader(session_username: Optional[str], session_file_path: Optional[P
 	if session_username and session_file_path and session_file_path.exists():
 		try:
 			loader.load_session_from_file(session_username, str(session_file_path))
-		except Exception:
+		except (FileNotFoundError, ValueError, insta_exceptions.InstaloaderException):
 			# Fall back to anonymous if session load fails
 			pass
 	return loader
@@ -154,6 +155,11 @@ def fetch_previews(
 			media_by_url[url] = items
 			if log_callback:
 				log_callback(f"Found {len(items)} item(s) in {url}")
+		except insta_exceptions.InstaloaderException as exc:
+			msg = f"{type(exc).__name__}: {exc}"
+			errors[url] = msg
+			if log_callback:
+				log_callback(f"Error: {url} -> {msg}")
 		except Exception as exc:
 			errors[url] = str(exc)
 			if log_callback:
@@ -212,7 +218,7 @@ def download_selected_images(
 				saved += 1
 				if log_callback:
 					log_callback(f"Saved: {target_path}")
-			except Exception as exc:
+			except requests.exceptions.RequestException as exc:
 				if log_callback:
 					log_callback(f"Error saving {filename}: {exc}")
 		finally:
@@ -270,7 +276,7 @@ with st.sidebar:
 	if load_clicked:
 		if session_username and sessionfile is not None:
 			SESSION_DIR.mkdir(parents=True, exist_ok=True)
-			session_path = SESSION_DIR / f"{session_username}.session"
+			session_path = SESSION_DIR / f"{_sanitize_filename(session_username)}.session"
 			with open(session_path, "wb") as f:
 				f.write(sessionfile.getbuffer())
 			st.session_state["session_username"] = session_username
