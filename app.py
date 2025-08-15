@@ -220,10 +220,16 @@ def download_selected_images(
 					log_callback(f"Saved: {target_path}")
 			except requests.exceptions.RequestException as exc:
 				if log_callback:
-					log_callback(f"Error saving {filename}: {exc}")
-		finally:
-			if sleep_seconds_between_downloads > 0 and idx < total:
-				time.sleep(sleep_seconds_between_downloads)
+					log_callback(f"Network error saving {filename}: {exc}")
+			except (IOError, OSError) as exc:
+				if log_callback:
+					log_callback(f"File I/O error saving {filename}: {exc}")
+			except Exception as exc:
+				if log_callback:
+					log_callback(f"Unexpected error saving {filename}: {exc}")
+			finally:
+				if sleep_seconds_between_downloads > 0 and idx < total:
+					time.sleep(sleep_seconds_between_downloads)
 	if progress_callback:
 		progress_callback(total, total, "Downloads complete")
 	return saved, skipped, base_download_dir
