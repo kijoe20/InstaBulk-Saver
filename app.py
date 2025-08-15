@@ -221,9 +221,9 @@ def download_selected_images(
 			except requests.exceptions.RequestException as exc:
 				if log_callback:
 					log_callback(f"Error saving {filename}: {exc}")
-		finally:
-			if sleep_seconds_between_downloads > 0 and idx < total:
-				time.sleep(sleep_seconds_between_downloads)
+			finally:
+				if sleep_seconds_between_downloads > 0 and idx < total:
+					time.sleep(sleep_seconds_between_downloads)
 	if progress_callback:
 		progress_callback(total, total, "Downloads complete")
 	return saved, skipped, base_download_dir
