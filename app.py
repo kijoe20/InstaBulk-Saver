@@ -184,7 +184,7 @@ def fetch_previews(
 				log_callback=log_callback
 			)
 			
-			shortcode = _extract_shortcode(url)
+			shortcode = post.shortcode
 			items: List[MediaItem] = []
 			
 			# Sidecar (carousel)
