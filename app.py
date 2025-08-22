@@ -70,18 +70,22 @@ def retry_with_backoff(
 		try:
 			return func(*args, **kwargs)
 		except Exception as exc:
-			if attempt == max_retries:
-				# Final attempt failed, re-raise the exception
-				raise exc
-			
-			if is_rate_limited_error(exc):
-				if log_callback:
-					log_callback(f"Rate limited (attempt {attempt + 1}/{max_retries + 1}): {exc}")
-					log_callback(f"Waiting before retry...")
-				exponential_backoff_sleep(attempt, base_delay)
-			else:
+			if not is_rate_limited_error(exc):
 				# Non-rate-limiting error, don't retry
 				raise exc
+
+			if log_callback:
+				log_callback(f"Rate limited (attempt {attempt + 1}/{max_retries + 1}): {exc}")
+
+			if attempt == max_retries:
+				# Final attempt failed, re-raise the exception
+				if log_callback:
+					log_callback("Max retries reached. Not retrying.")
+				raise exc
+			
+			if log_callback:
+				log_callback(f"Waiting before retry...")
+			exponential_backoff_sleep(attempt, base_delay)
 
 
 # ==========================
