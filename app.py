@@ -62,7 +62,7 @@ def retry_with_backoff(
 	base_delay: float = 5.0,
 	log_callback: Optional[Callable[[str], None]] = None,
 	**kwargs
-) -> any:
+) -> Any:
 	"""
 	Retry a function with exponential backoff on rate limiting errors.
 	"""
