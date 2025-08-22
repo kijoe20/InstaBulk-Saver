@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -23,6 +24,68 @@ class MediaItem:
 	download_url: str
 	filename: str
 	origin_url: str
+
+
+# ==========================
+# Rate Limiting and Retry Logic
+# ==========================
+def exponential_backoff_sleep(attempt: int, base_delay: float = 5.0, max_delay: float = 300.0) -> None:
+	"""
+	Sleep with exponential backoff plus jitter to avoid thundering herd.
+	"""
+	delay = min(base_delay * (2 ** attempt), max_delay)
+	jitter = random.uniform(0.1, 0.3) * delay  # Add 10-30% jitter
+	total_delay = delay + jitter
+	time.sleep(total_delay)
+
+
+def is_rate_limited_error(exception: Exception) -> bool:
+	"""
+	Check if the exception indicates rate limiting from Instagram.
+	"""
+	error_msg = str(exception).lower()
+	rate_limit_indicators = [
+		"please wait a few minutes",
+		"401 unauthorized",
+		"rate limit",
+		"too many requests",
+		"temporarily blocked",
+		"try again later"
+	]
+	return any(indicator in error_msg for indicator in rate_limit_indicators)
+
+
+def retry_with_backoff(
+	func: Callable,
+	*args,
+	max_retries: int = 3,
+	base_delay: float = 5.0,
+	log_callback: Optional[Callable[[str], None]] = None,
+	**kwargs
+) -> Any:
+	"""
+	Retry a function with exponential backoff on rate limiting errors.
+	"""
+	for attempt in range(max_retries + 1):
+		try:
+			return func(*args, **kwargs)
+		except Exception as exc:
+			if not is_rate_limited_error(exc):
+				# Non-rate-limiting error, don't retry
+				raise exc
+
+			if log_callback:
+				log_callback(f"Rate limited (attempt {attempt + 1}/{max_retries + 1}): {exc}")
+
+			if attempt == max_retries:
+				# Final attempt failed, re-raise the exception
+				if log_callback:
+					log_callback("Max retries reached. Not retrying.")
+				raise exc
+			
+			if log_callback:
+				log_callback(f"Waiting before retry...")
+			exponential_backoff_sleep(attempt, base_delay)
 
 
 # ==========================
@@ -72,11 +135,14 @@ def _build_loader(session_username: Optional[str], session_file_path: Optional[P
 		download_video_thumbnails=False,
 		save_metadata=False,
 	)
-	# Polite user agent
+	# More realistic user agent
 	loader.context.user_agent = (
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-		"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+		"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 	)
+	# Increase request timeout
+	loader.context.request_timeout = 30.0
+	
 	if session_username and session_file_path and session_file_path.exists():
 		try:
 			loader.load_session_from_file(session_username, str(session_file_path))
@@ -90,7 +156,7 @@ def fetch_previews(
 	input_urls: List[str],
 	session_username: Optional[str] = None,
 	session_file_path: Optional[Path] = None,
-	sleep_seconds_between_requests: float = 2.0,
+	sleep_seconds_between_requests: float = 8.0,  # Increased from 2.0 to 8.0
 	progress_callback: Optional[Callable[[int, int, str], None]] = None,
 	log_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[Dict[str, List[MediaItem]], Dict[str, str]]:
@@ -102,15 +168,29 @@ def fetch_previews(
 	media_by_url: Dict[str, List[MediaItem]] = {}
 	errors: Dict[str, str] = {}
 	total = len(input_urls)
+	
 	for idx, url in enumerate(input_urls, start=1):
 		if progress_callback:
 			progress_callback(idx - 1, total, f"Fetching: {url}")
+		
 		try:
-			shortcode = _extract_shortcode(url)
-			if not shortcode:
-				raise ValueError("Could not parse Instagram shortcode from URL")
-			post = Post.from_shortcode(loader.context, shortcode)
+			def fetch_post_data():
+				shortcode = _extract_shortcode(url)
+				if not shortcode:
+					raise ValueError("Could not parse Instagram shortcode from URL")
+				return Post.from_shortcode(loader.context, shortcode)
+			
+			# Retry with exponential backoff for rate limiting
+			post = retry_with_backoff(
+				fetch_post_data,
+				max_retries=3,
+				base_delay=10.0,  # Start with 10 second base delay
+				log_callback=log_callback
+			)
+			
+			shortcode = post.shortcode
 			items: List[MediaItem] = []
+			
 			# Sidecar (carousel)
 			is_sidecar = post.typename == "GraphSidecar"
 			if is_sidecar:
@@ -154,19 +234,26 @@ def fetch_previews(
 				)
 			media_by_url[url] = items
 			if log_callback:
-				log_callback(f"Found {len(items)} item(s) in {url}")
+				log_callback(f"✓ Found {len(items)} item(s) in {url}")
+				
 		except insta_exceptions.InstaloaderException as exc:
 			msg = f"{type(exc).__name__}: {exc}"
 			errors[url] = msg
 			if log_callback:
-				log_callback(f"Error: {url} -> {msg}")
+				log_callback(f"❌ Error: {url} -> {msg}")
 		except Exception as exc:
 			errors[url] = str(exc)
 			if log_callback:
-				log_callback(f"Error: {url} -> {exc}")
+				log_callback(f"❌ Error: {url} -> {exc}")
 		finally:
 			if sleep_seconds_between_requests > 0 and idx < total:
-				time.sleep(sleep_seconds_between_requests)
+				# Add random jitter to the sleep time
+				jitter = random.uniform(0.5, 1.5)  # 50-150% of base delay
+				actual_sleep = sleep_seconds_between_requests * jitter
+				if log_callback:
+					log_callback(f"⏳ Waiting {actual_sleep:.1f}s before next request...")
+				time.sleep(actual_sleep)
+	
 	if progress_callback:
 		progress_callback(total, total, "Done")
 	return media_by_url, errors
@@ -183,7 +270,7 @@ def _sanitize_filename(name: str) -> str:
 def download_selected_images(
 	selected_items: List[MediaItem],
 	base_download_dir: Path,
-	sleep_seconds_between_downloads: float = 0.5,
+	sleep_seconds_between_downloads: float = 2.0,  # Increased from 0.5 to 2.0
 	progress_callback: Optional[Callable[[int, int, str], None]] = None,
 	log_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[int, int, Path]:
@@ -193,7 +280,7 @@ def download_selected_images(
 	saved = 0
 	skipped = 0
 	_headers = {
-		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 	}
 	total = len(selected_items)
 	for idx, item in enumerate(selected_items, start=1):
@@ -206,30 +293,43 @@ def download_selected_images(
 		if target_path.exists():
 			skipped += 1
 			if log_callback:
-				log_callback(f"Skipped (exists): {target_path}")
+				log_callback(f"⏭️ Skipped (exists): {target_path}")
 		else:
 			try:
-				with requests.get(item.download_url, stream=True, headers=_headers, timeout=30) as r:
-					r.raise_for_status()
-					with open(target_path, "wb") as f:
-						for chunk in r.iter_content(chunk_size=8192):
-							if chunk:
-								f.write(chunk)
+				def download_file():
+					with requests.get(item.download_url, stream=True, headers=_headers, timeout=60) as r:
+						r.raise_for_status()
+						with open(target_path, "wb") as f:
+							for chunk in r.iter_content(chunk_size=8192):
+								if chunk:
+									f.write(chunk)
+				
+				# Retry download with backoff
+				retry_with_backoff(
+					download_file,
+					max_retries=2,
+					base_delay=3.0,
+					log_callback=log_callback
+				)
+				
 				saved += 1
 				if log_callback:
-					log_callback(f"Saved: {target_path}")
+					log_callback(f"✅ Saved: {target_path}")
 			except requests.exceptions.RequestException as exc:
 				if log_callback:
-					log_callback(f"Network error saving {filename}: {exc}")
+					log_callback(f"❌ Network error saving {filename}: {exc}")
 			except (IOError, OSError) as exc:
 				if log_callback:
-					log_callback(f"File I/O error saving {filename}: {exc}")
+					log_callback(f"❌ File I/O error saving {filename}: {exc}")
 			except Exception as exc:
 				if log_callback:
-					log_callback(f"Unexpected error saving {filename}: {exc}")
+					log_callback(f"❌ Unexpected error saving {filename}: {exc}")
 			finally:
 				if sleep_seconds_between_downloads > 0 and idx < total:
-					time.sleep(sleep_seconds_between_downloads)
+					# Add jitter to download delays too
+					jitter = random.uniform(0.8, 1.2)
+					actual_sleep = sleep_seconds_between_downloads * jitter
+					time.sleep(actual_sleep)
 	if progress_callback:
 		progress_callback(total, total, "Downloads complete")
 	return saved, skipped, base_download_dir
@@ -272,8 +372,16 @@ st.title(APP_TITLE)
 
 with st.sidebar:
 	st.header("Authentication (optional)")
+	st.info("💡 For better rate limit handling, consider using an authenticated session")
 	session_username = st.text_input("Instagram username (for session)", value=st.session_state["session_username"])
-	sessionfile = st.file_uploader("Instaloader session file", type=["session"], help="Upload a session file created by Instaloader for private content access")
+	sessionfile = st.file_uploader("Instaloader session file", type=["session"], help="Upload a session file created by Instaloader for private content access. Authenticated sessions have higher rate limits.")
+	
+	# Show current session status
+	if st.session_state.get("session_username"):
+		st.success(f"✅ Session loaded for: {st.session_state['session_username']}")
+	else:
+		st.warning("⚠️ Using anonymous access (lower rate limits)")
+	
 	col_a, col_b = st.columns(2)
 	with col_a:
 		load_clicked = st.button("Load Session")
@@ -298,8 +406,14 @@ with st.sidebar:
 st.markdown("""
 **Instructions**
 - Paste Instagram post URLs separated by commas or new lines.
-- Click Preview to list all images/videos found.
+- Click Preview to list all images/videos found (with enhanced rate limiting).
 - Select desired media and click Download Selected.
+
+**Rate Limiting Features:**
+- ⚡ Automatic retry with exponential backoff for 401 errors
+- 🔄 8-second delays between requests with random jitter
+- 📊 Enhanced logging shows retry attempts and wait times
+- 🛡️ Better protection against Instagram's anti-bot measures
 """)
 
 raw_input = st.text_area("Instagram post URLs", height=150, placeholder="https://www.instagram.com/p/XXXXXXXX/\nhttps://www.instagram.com/reel/XXXXXXXX/")
@@ -330,7 +444,7 @@ if preview_clicked:
 			parsed,
 			session_username=st.session_state.get("session_username") or None,
 			session_file_path=Path(st.session_state.get("session_file_path")) if st.session_state.get("session_file_path") else None,
-			sleep_seconds_between_requests=2.0,
+			sleep_seconds_between_requests=8.0,
 			progress_callback=_ui_progress,
 			log_callback=_log,
 		)
@@ -393,7 +507,7 @@ if all_items:
 			saved, skipped, base_dir = download_selected_images(
 				selected,
 				BASE_DOWNLOAD_DIR,
-				sleep_seconds_between_downloads=0.5,
+				sleep_seconds_between_downloads=2.0,
 				progress_callback=_dl_progress,
 				log_callback=_log,
 			)
